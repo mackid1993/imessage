@@ -1867,22 +1867,14 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(msgGUID)
 
-	conv := c.portalToConversation(msg.Portal)
-
-	// Send MoveToRecycleBin + PermanentDelete to sync deletion to user's Apple devices.
-	if err := c.client.SendMoveMessagesToRecycleBin(conv, c.handle, []string{msgGUID}); err != nil {
-		log.Warn().Err(err).Str("guid", msgGUID).
-			Msg("Failed to send MoveToRecycleBin+PermanentDelete for message")
-	} else {
-		log.Info().Str("guid", msgGUID).
-			Msg("Sent MoveToRecycleBin+PermanentDelete for message")
-	}
-
-	// Delete the CloudKit record so the message doesn't come back on re-backfill
-	// (even after a bridge reset with a fresh database).
+	// Hard-delete the CloudKit record FIRST, before any APNs messages.
+	// MoveToRecycleBin causes Apple to move records to recoverableMessageDeleteZone,
+	// making them impossible to delete from messageManateeZone afterwards.
+	// Delete while the record is still in the main zone.
 	c.deleteCloudMessageByGUID(*log, msgGUID)
 
-	// Send unsend to remove the message from the recipient's device too.
+	// Send unsend to remove the message from all devices (sender + recipient).
+	conv := c.portalToConversation(msg.Portal)
 	_, err := c.client.SendUnsend(conv, msgGUID, 0, c.handle)
 	return err
 }
@@ -2077,60 +2069,57 @@ func (c *IMClient) findAndDeleteCloudMessagesByChatIdentifier(log zerolog.Logger
 	}
 }
 
-// deleteCloudMessageByGUID removes a message's CloudKit record so it doesn't
-// come back on re-backfill (even after a full bridge reset). Tries the local DB
-// for the record_name first; if not found (real-time messages don't store it),
-// falls back to a full CloudKit scan to find the record by GUID.
+// deleteCloudMessageByGUID hard-deletes a message's CloudKit record from
+// messageManateeZone so it never comes back on re-backfill — even after a full
+// bridge reset. Tries local DB for record_name first; falls back to a
+// synchronous CloudKit scan by GUID.
 func (c *IMClient) deleteCloudMessageByGUID(log zerolog.Logger, guid string) {
-	// Try local DB lookup first (fast path — works for CloudKit-backfilled messages).
+	// Fast path: local DB has the record_name (CloudKit-backfilled messages).
 	if c.cloudStore != nil {
 		if recordName := c.cloudStore.getRecordNameByGUID(context.Background(), guid); recordName != "" {
 			if err := c.client.DeleteCloudMessages([]string{recordName}); err != nil {
 				log.Warn().Err(err).Str("record_name", recordName).
-					Msg("Failed to delete CloudKit message record")
+					Msg("Failed to hard-delete CloudKit message record")
 			} else {
 				log.Info().Str("record_name", recordName).Str("guid", guid).
-					Msg("Deleted CloudKit message record")
+					Msg("Hard-deleted CloudKit message record")
 			}
 			c.cloudStore.softDeleteMessageByGUID(context.Background(), guid)
 			return
 		}
-		// Soft-delete locally even if we don't have the record_name yet.
 		c.cloudStore.softDeleteMessageByGUID(context.Background(), guid)
 	}
 
-	// Slow path: scan CloudKit for the record_name by GUID.
-	// Run in background so we don't block the delete response.
-	go func() {
-		log.Info().Str("guid", guid).Msg("Scanning CloudKit for message record to delete")
-		var token *string
-		for page := 0; page < 256; page++ {
-			resp, err := safeCloudSyncMessages(c.client, token)
-			if err != nil {
-				log.Warn().Err(err).Str("guid", guid).
-					Msg("Failed to scan CloudKit messages for delete")
+	// Slow path: scan all CloudKit message records to find record_name by GUID.
+	// Must complete synchronously so the record is gone before we return.
+	log.Info().Str("guid", guid).Msg("Scanning CloudKit for message record to hard-delete")
+	var token *string
+	for page := 0; page < 256; page++ {
+		resp, err := safeCloudSyncMessages(c.client, token)
+		if err != nil {
+			log.Warn().Err(err).Str("guid", guid).
+				Msg("Failed to scan CloudKit messages for delete")
+			return
+		}
+		for _, msg := range resp.Messages {
+			if msg.Guid == guid && msg.RecordName != "" {
+				if delErr := c.client.DeleteCloudMessages([]string{msg.RecordName}); delErr != nil {
+					log.Warn().Err(delErr).Str("record_name", msg.RecordName).
+						Msg("Failed to hard-delete CloudKit message record (scan)")
+				} else {
+					log.Info().Str("record_name", msg.RecordName).Str("guid", guid).
+						Msg("Hard-deleted CloudKit message record (scan)")
+				}
 				return
 			}
-			for _, msg := range resp.Messages {
-				if msg.Guid == guid && msg.RecordName != "" {
-					if delErr := c.client.DeleteCloudMessages([]string{msg.RecordName}); delErr != nil {
-						log.Warn().Err(delErr).Str("record_name", msg.RecordName).
-							Msg("Failed to delete CloudKit message record (scan)")
-					} else {
-						log.Info().Str("record_name", msg.RecordName).Str("guid", guid).
-							Msg("Deleted CloudKit message record (scan)")
-					}
-					return
-				}
-			}
-			prev := ptrStringOr(token, "")
-			token = resp.ContinuationToken
-			if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
-				break
-			}
 		}
-		log.Info().Str("guid", guid).Msg("Message not found in CloudKit (may not have been synced)")
-	}()
+		prev := ptrStringOr(token, "")
+		token = resp.ContinuationToken
+		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
+			break
+		}
+	}
+	log.Warn().Str("guid", guid).Msg("Message not found in CloudKit — cannot hard-delete")
 }
 
 // ============================================================================
