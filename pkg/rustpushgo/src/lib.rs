@@ -2700,7 +2700,9 @@ impl Client {
         Ok(())
     }
 
-    /// Send a MoveToRecycleBin for individual messages (30-day recoverable delete).
+    /// Send MoveToRecycleBin + PermanentDelete for individual messages.
+    /// MoveToRecycleBin alone only moves to "Recently Deleted" (30-day retention).
+    /// PermanentDelete ensures the messages are actually removed.
     pub async fn send_move_messages_to_recycle_bin(
         &self,
         conversation: WrappedConversation,
@@ -2709,15 +2711,24 @@ impl Client {
     ) -> Result<(), WrappedError> {
         let conv: ConversationData = (&conversation).into();
         let delete_msg = MoveToRecycleBinMessage {
-            target: DeleteTarget::Messages(message_uuids),
+            target: DeleteTarget::Messages(message_uuids.clone()),
             recoverable_delete_date: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         };
-        let mut msg = MessageInst::new(conv, &handle, Message::MoveToRecycleBin(delete_msg));
+        let mut msg = MessageInst::new(conv.clone(), &handle, Message::MoveToRecycleBin(delete_msg));
         self.client.send(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send MoveToRecycleBin for messages: {}", e) })?;
+
+        // Follow up with PermanentDelete so the messages are actually removed.
+        let perm_msg = PermanentDeleteMessage {
+            target: DeleteTarget::Messages(message_uuids),
+            is_scheduled: false,
+        };
+        let mut perm = MessageInst::new(conv, &handle, Message::PermanentDelete(perm_msg));
+        self.client.send(&mut perm).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send PermanentDelete for messages: {}", e) })?;
         Ok(())
     }
 
