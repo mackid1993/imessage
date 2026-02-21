@@ -86,10 +86,19 @@ func (c *IMClient) setCloudSyncDone() {
 	// Safety-net goroutine: if some FetchMessages calls never complete (e.g.
 	// portal deleted before bridgev2 processes the ChatResync event, existing
 	// portals that don't trigger a forward backfill, or a crash/timeout),
-	// force-flush the buffer after 10 seconds so APNs messages are never
+	// force-flush the buffer after a timeout so APNs messages are never
 	// permanently suppressed.
+	//
+	// The timeout scales with the number of pending portals: 30s base plus
+	// 2s per portal. On slow systems with many portals, the old fixed 10s
+	// timeout fired before forward backfills could complete, prematurely
+	// flushing buffered APNs messages.
+	safetyTimeout := 30*time.Second + time.Duration(pending)*2*time.Second
+	if safetyTimeout > 5*time.Minute {
+		safetyTimeout = 5 * time.Minute
+	}
 	go func() {
-		deadline := time.Now().Add(10 * time.Second)
+		deadline := time.Now().Add(safetyTimeout)
 		for time.Now().Before(deadline) {
 			if atomic.LoadInt64(&c.pendingInitialBackfills) <= 0 {
 				// onForwardBackfillDone already flushed the buffer.
@@ -99,6 +108,7 @@ func (c *IMClient) setCloudSyncDone() {
 		}
 		remaining := atomic.LoadInt64(&c.pendingInitialBackfills)
 		log.Warn().Int64("remaining", remaining).
+			Dur("timeout", safetyTimeout).
 			Msg("APNs buffer flush timeout: not all initial backfills completed, forcing flush")
 		// Mirror what onForwardBackfillDone does: stamp the flush time so the
 		// read-receipt grace window (handleReadReceipt) knows the burst is done.

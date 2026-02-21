@@ -3308,16 +3308,24 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 		return
 	}
 	log.Info().Int("uncached", len(pending)).Msg("Forward backfill: pre-uploading uncached attachments in parallel")
+
+	// Derive a deadline context so the entire chunk's pre-upload is bounded.
+	// Without this, wg.Wait() blocks indefinitely on slow systems.
+	const chunkAttachmentTimeout = 5 * time.Minute
+	chunkCtx, chunkCancel := context.WithTimeout(ctx, chunkAttachmentTimeout)
+	defer chunkCancel()
+
 	const maxParallel = 32
 	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
+	var completed int64
 	for _, p := range pending {
 		wg.Add(1)
 		go func(p pendingAtt) {
 			defer wg.Done()
 			select {
 			case sem <- struct{}{}:
-			case <-ctx.Done():
+			case <-chunkCtx.Done():
 				return
 			}
 			defer func() { <-sem }()
@@ -3328,11 +3336,28 @@ func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMe
 						Msg("Forward backfill pre-upload: recovered panic")
 				}
 			}()
-			c.downloadAndUploadAttachment(ctx, p.row, p.sender, p.ts, p.hasText, p.idx, p.att)
+			c.downloadAndUploadAttachment(chunkCtx, p.row, p.sender, p.ts, p.hasText, p.idx, p.att)
+			atomic.AddInt64(&completed, 1)
 		}(p)
 	}
-	wg.Wait()
-	log.Info().Int("processed", len(pending)).Msg("Forward backfill: pre-upload complete")
+
+	// Wait for all goroutines OR the chunk timeout to expire.
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		log.Info().Int("processed", len(pending)).Msg("Forward backfill: pre-upload complete")
+	case <-chunkCtx.Done():
+		finished := atomic.LoadInt64(&completed)
+		log.Warn().
+			Int64("completed", finished).
+			Int("total", len(pending)).
+			Dur("timeout", chunkAttachmentTimeout).
+			Msg("Forward backfill: pre-upload timed out, continuing with partial cache")
+	}
 }
 
 func reverseCloudMessageRows(rows []cloudMessageRow) {
