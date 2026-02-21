@@ -977,6 +977,20 @@ func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, 
 	return normalized, nil
 }
 
+// getChatIdentifierByPortalID returns the CloudKit chat_identifier (e.g. "iMessage;-;user@example.com")
+// for a given portal_id. Used to construct the chat GUID for MoveToRecycleBin messages.
+func (s *cloudBackfillStore) getChatIdentifierByPortalID(ctx context.Context, portalID string) string {
+	var chatID string
+	err := s.db.QueryRow(ctx,
+		`SELECT cloud_chat_id FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND cloud_chat_id <> '' LIMIT 1`,
+		s.loginID, portalID,
+	).Scan(&chatID)
+	if err != nil {
+		return ""
+	}
+	return chatID
+}
+
 // getDisplayNameByPortalID returns the CloudKit display_name for a given portal_id.
 // This is the user-set group name (cv_name from the iMessage protocol), NOT an
 // auto-generated label. Returns empty string if none found or if the group is unnamed.

@@ -253,6 +253,7 @@ var _ bridgev2.IdentifierResolvingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.BackfillingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.BackfillingNetworkAPIWithLimits = (*IMClient)(nil)
 var _ bridgev2.DeleteChatHandlingNetworkAPI = (*IMClient)(nil)
+var _ bridgev2.RedactionHandlingNetworkAPI = (*IMClient)(nil)
 var _ rustpushgo.MessageCallback = (*IMClient)(nil)
 var _ rustpushgo.UpdateUsersCallback = (*IMClient)(nil)
 
@@ -1858,12 +1859,18 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	log := zerolog.Ctx(ctx)
 	msgGUID := string(msg.TargetMessage.ID)
 
+	// Strip attachment suffixes like _att0, _att1 — Rust expects a pure UUID.
+	if idx := strings.Index(msgGUID, "_att"); idx > 0 {
+		msgGUID = msgGUID[:idx]
+	}
+
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(msgGUID)
 
 	conv := c.portalToConversation(msg.Portal)
 
 	// Move the message to iCloud's Recently Deleted (30-day recoverable).
+	// This syncs the deletion to the user's own Apple devices.
 	if err := c.client.SendMoveMessagesToRecycleBin(conv, c.handle, []string{msgGUID}); err != nil {
 		log.Warn().Err(err).Str("guid", msgGUID).
 			Msg("Failed to move message to iCloud recycle bin")
@@ -1872,6 +1879,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 			Msg("Moved message to iCloud recycle bin")
 	}
 
+	// Send unsend to remove the message from the recipient's device too.
 	_, err := c.client.SendUnsend(conv, msgGUID, 0, c.handle)
 	return err
 }
@@ -1917,9 +1925,8 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 }
 
 // HandleMatrixDeleteChat is called when the user deletes a chat in Matrix/Beeper.
-// It cleans up local state (echo detection, local DB) but does NOT touch Apple:
-// no MoveToRecycleBin APNs message, no CloudKit record deletion. The chat stays
-// on the user's Apple devices; only the Beeper portal is removed.
+// It sends MoveToRecycleBin to Apple (syncing the delete to Mac/iPhone), then
+// cleans up local state (echo detection, local DB).
 func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.MatrixDeleteChat) error {
 	if c.client == nil {
 		return bridgev2.ErrNotLoggedIn
@@ -1936,6 +1943,20 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 
 	log := zerolog.Ctx(ctx)
 	portalID := string(msg.Portal.ID)
+
+	// Send MoveToRecycleBin + PermanentDelete to Apple so the chat disappears
+	// on the user's Mac/iPhone/iPad.
+	conv := c.portalToConversation(msg.Portal)
+	chatGUID := c.portalToChatGUID(portalID)
+	if chatGUID != "" {
+		if err := c.client.SendMoveToRecycleBin(conv, c.handle, chatGUID); err != nil {
+			log.Warn().Err(err).Str("chat_guid", chatGUID).
+				Msg("Failed to send MoveToRecycleBin to Apple")
+		} else {
+			log.Info().Str("chat_guid", chatGUID).
+				Msg("Sent MoveToRecycleBin + PermanentDelete to Apple")
+		}
+	}
 
 	// Mark as deleted in memory — NOT a tombstone, just echo protection.
 	// New messages from this contact should still create fresh portals.
@@ -4457,6 +4478,28 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		Participants: []string{c.handle, sendTo},
 		IsSms:        isSms,
 	}
+}
+
+// portalToChatGUID constructs the iMessage chat GUID for a portal, used for
+// MoveToRecycleBin messages. Tries the cloud_chat DB first (has the exact
+// chat_identifier from CloudKit), then falls back to constructing it from the
+// portal ID.
+func (c *IMClient) portalToChatGUID(portalID string) string {
+	// Try cloud store first — it has the authoritative chat_identifier.
+	if c.cloudStore != nil {
+		if chatID := c.cloudStore.getChatIdentifierByPortalID(context.Background(), portalID); chatID != "" {
+			return chatID
+		}
+	}
+	// Fallback: construct from portal ID.
+	service := "iMessage"
+	if c.isPortalSMS(portalID) {
+		service = "SMS"
+	}
+	if strings.HasPrefix(portalID, "gid:") {
+		return service + ";+;" + strings.TrimPrefix(portalID, "gid:")
+	}
+	return service + ";-;" + strings.TrimPrefix(strings.TrimPrefix(portalID, "tel:"), "mailto:")
 }
 
 // resolveGroupMembers returns the participant list for a group portal.
