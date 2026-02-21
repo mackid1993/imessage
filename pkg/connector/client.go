@@ -1869,14 +1869,28 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 	conv := c.portalToConversation(msg.Portal)
 
-	// Move the message to iCloud's Recently Deleted (30-day recoverable).
-	// This syncs the deletion to the user's own Apple devices.
+	// Send MoveToRecycleBin + PermanentDelete to sync deletion to user's Apple devices.
 	if err := c.client.SendMoveMessagesToRecycleBin(conv, c.handle, []string{msgGUID}); err != nil {
 		log.Warn().Err(err).Str("guid", msgGUID).
-			Msg("Failed to move message to iCloud recycle bin")
+			Msg("Failed to send MoveToRecycleBin+PermanentDelete for message")
 	} else {
 		log.Info().Str("guid", msgGUID).
-			Msg("Moved message to iCloud recycle bin")
+			Msg("Sent MoveToRecycleBin+PermanentDelete for message")
+	}
+
+	// Delete the CloudKit record so the message doesn't come back on re-backfill.
+	if c.cloudStore != nil {
+		if recordName := c.cloudStore.getRecordNameByGUID(ctx, msgGUID); recordName != "" {
+			if err := c.client.DeleteCloudMessages([]string{recordName}); err != nil {
+				log.Warn().Err(err).Str("record_name", recordName).
+					Msg("Failed to delete CloudKit message record")
+			} else {
+				log.Info().Str("record_name", recordName).Str("guid", msgGUID).
+					Msg("Deleted CloudKit message record")
+			}
+		}
+		// Soft-delete local DB row (preserves UUID for echo detection).
+		c.cloudStore.softDeleteMessageByGUID(ctx, msgGUID)
 	}
 
 	// Send unsend to remove the message from the recipient's device too.

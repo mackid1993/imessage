@@ -1158,6 +1158,15 @@ func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid strin
 	return recordName
 }
 
+// softDeleteMessageByGUID marks a cloud_message row as deleted=TRUE so it won't
+// be re-bridged on backfill, while preserving the UUID for echo detection.
+func (s *cloudBackfillStore) softDeleteMessageByGUID(ctx context.Context, guid string) {
+	_, _ = s.db.Exec(ctx,
+		`UPDATE cloud_message SET deleted=TRUE WHERE login_id=$1 AND guid=$2`,
+		s.loginID, guid,
+	)
+}
+
 // hasMessageUUID checks if a message UUID exists in cloud_message for this login.
 // Used for echo detection: if the UUID is known, the message is an echo of a
 // previously-seen message and should not create a new portal.
