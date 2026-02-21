@@ -131,6 +131,19 @@ func (c *IMClient) isCloudSyncDone() bool {
 // every CloudKit sync so short-lived entries are repopulated anyway.
 const recentlyDeletedPortalsTTL = 24 * time.Hour
 
+// trackDeletedChat adds a portal ID to the recently-deleted set so stale APNs
+// echoes and CloudKit sync don't recreate the portal.
+func (c *IMClient) trackDeletedChat(portalID string) {
+	c.recentlyDeletedPortalsMu.Lock()
+	if c.recentlyDeletedPortals == nil {
+		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
+	}
+	c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
+		deletedAt: time.Now(),
+	}
+	c.recentlyDeletedPortalsMu.Unlock()
+}
+
 // pruneRecentlyDeletedPortals removes entries older than the TTL.
 // Called after bootstrap sync to prevent unbounded memory growth.
 func (c *IMClient) pruneRecentlyDeletedPortals(log zerolog.Logger) {

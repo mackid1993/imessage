@@ -1856,26 +1856,8 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return bridgev2.ErrNotLoggedIn
 	}
 
-	log := zerolog.Ctx(ctx)
-	msgGUID := string(msg.TargetMessage.ID)
-
-	// Strip attachment suffixes like _att0, _att1 — Rust expects a pure UUID.
-	if idx := strings.Index(msgGUID, "_att"); idx > 0 {
-		msgGUID = msgGUID[:idx]
-	}
-
-	// Track outbound unsend so we can suppress the APNs echo.
-	c.trackOutboundUnsend(msgGUID)
-
-	// Hard-delete the CloudKit record FIRST, before any APNs messages.
-	// MoveToRecycleBin causes Apple to move records to recoverableMessageDeleteZone,
-	// making them impossible to delete from messageManateeZone afterwards.
-	// Delete while the record is still in the main zone.
-	c.deleteCloudMessageByGUID(*log, msgGUID)
-
-	// Send unsend to remove the message from all devices (sender + recipient).
 	conv := c.portalToConversation(msg.Portal)
-	_, err := c.client.SendUnsend(conv, msgGUID, 0, c.handle)
+	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
 	return err
 }
 
@@ -1920,17 +1902,14 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 }
 
 // HandleMatrixDeleteChat is called when the user deletes a chat in Matrix/Beeper.
-// It sends MoveToRecycleBin to Apple (syncing the delete to Mac/iPhone), then
-// cleans up local state (echo detection, local DB).
+// It sends a MoveToRecycleBin message via APNs (notifies other Apple devices)
+// and deletes the chat record from CloudKit (prevents reappearing during future syncs).
 func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.MatrixDeleteChat) error {
 	if c.client == nil {
 		return bridgev2.ErrNotLoggedIn
 	}
 
-	// Flush the APNs reorder buffer before processing the delete. Any messages
-	// currently buffered (including echoes for this portal) are dispatched now
-	// while the portal still exists, so they don't float around and try to
-	// resurrect the portal after it's deleted.
+	// Flush the APNs reorder buffer before processing the delete.
 	if c.msgBuffer != nil {
 		c.msgBuffer.flush()
 	}
@@ -1939,52 +1918,92 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 	log := zerolog.Ctx(ctx)
 	portalID := string(msg.Portal.ID)
 
-	// Send MoveToRecycleBin + PermanentDelete to Apple so the chat disappears
-	// on the user's Mac/iPhone/iPad.
 	conv := c.portalToConversation(msg.Portal)
-	chatGUID := c.portalToChatGUID(portalID)
-	if chatGUID != "" {
-		if err := c.client.SendMoveToRecycleBin(conv, c.handle, chatGUID); err != nil {
-			log.Warn().Err(err).Str("chat_guid", chatGUID).
-				Msg("Failed to send MoveToRecycleBin to Apple")
-		} else {
-			log.Info().Str("chat_guid", chatGUID).
-				Msg("Sent MoveToRecycleBin + PermanentDelete to Apple")
-		}
-	}
 
-	// Mark as deleted in memory — NOT a tombstone, just echo protection.
-	// New messages from this contact should still create fresh portals.
-	c.recentlyDeletedPortalsMu.Lock()
-	if c.recentlyDeletedPortals == nil {
-		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
-	}
-	c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
-		deletedAt: time.Now(),
-	}
-	c.recentlyDeletedPortalsMu.Unlock()
+	// Build the chat GUID for the MoveToRecycleBin target.
+	chatGuid := c.portalToChatGUID(portalID)
 
-	// Clean up local DB — soft-deletes cloud_message rows (preserves UUIDs for
-	// echo detection) and hard-deletes cloud_chat rows. This prevents stale APNs
-	// echoes from resurrecting the portal even after a bridge restart.
+	log.Info().Str("chat_guid", chatGuid).Str("portal_id", portalID).Msg("Deleting chat from Apple")
+
+	// Track as recently deleted so stale APNs echoes don't recreate it.
+	c.trackDeletedChat(portalID)
+
+	// Clean up local DB FIRST (fast) — prevents portal resurrection on restart
+	// even if the CloudKit calls below hang or fail.
+	var chatRecordNames, msgRecordNames []string
 	if c.cloudStore != nil {
+		chatRecordNames, _ = c.cloudStore.getCloudRecordNamesByPortalID(ctx, portalID)
+		msgRecordNames, _ = c.cloudStore.getMessageRecordNamesByPortalID(ctx, portalID)
+
+		// Fallback: if no record_names by portal_id, look up by group_id.
 		groupID := ""
 		if strings.HasPrefix(portalID, "gid:") {
 			groupID = strings.TrimPrefix(portalID, "gid:")
 		}
+		if len(chatRecordNames) == 0 && groupID != "" {
+			chatRecordNames, _ = c.cloudStore.getCloudRecordNamesByGroupID(ctx, groupID)
+		}
+		if len(msgRecordNames) == 0 && groupID != "" {
+			msgRecordNames, _ = c.cloudStore.getMessageRecordNamesByGroupID(ctx, groupID)
+		}
+
+		// Delete local records for both portal_id and group_id.
 		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete local cloud records")
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to delete local cloud records")
 		} else {
-			log.Info().Str("portal_id", portalID).Msg("Soft-deleted local cloud_chat and cloud_message records")
+			log.Info().Str("portal_id", portalID).Msg("Deleted local cloud_chat and cloud_message records")
 		}
 		if groupID != "" {
 			if err := c.cloudStore.deleteLocalChatByGroupID(ctx, groupID); err != nil {
-				log.Warn().Err(err).Str("group_id", groupID).Msg("Failed to soft-delete local cloud records by group_id")
+				log.Warn().Err(err).Str("group_id", groupID).Msg("Failed to delete local cloud records by group_id")
 			}
 		}
 	}
 
+	// Delete from Apple synchronously — MoveToRecycleBin + CloudKit cleanup.
+	c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames)
+
 	return nil
+}
+
+// deleteFromApple sends MoveToRecycleBin via APNs and deletes known CloudKit
+// records synchronously, then kicks off a background scan to catch any records
+// not in the local DB. Local DB is already cleaned before this is called, so
+// restarts are safe even if the background scan is interrupted.
+func (c *IMClient) deleteFromApple(portalID string, conv rustpushgo.WrappedConversation, chatGuid string, chatRecordNames, msgRecordNames []string) {
+	log := c.Main.Bridge.Log.With().Str("portal_id", portalID).Str("chat_guid", chatGuid).Logger()
+
+	if err := c.client.SendMoveToRecycleBin(conv, c.handle, chatGuid); err != nil {
+		log.Warn().Err(err).Msg("Failed to send MoveToRecycleBin via APNs")
+	} else {
+		log.Info().Msg("Sent MoveToRecycleBin via APNs")
+	}
+
+	// Delete known records synchronously (fast — no full table scan).
+	if len(chatRecordNames) > 0 {
+		if err := c.client.DeleteCloudChats(chatRecordNames); err != nil {
+			log.Warn().Err(err).Strs("record_names", chatRecordNames).Msg("Failed to delete chats from CloudKit")
+		} else {
+			log.Info().Strs("record_names", chatRecordNames).Msg("Deleted chat records from CloudKit")
+		}
+	}
+	if len(msgRecordNames) > 0 {
+		if err := c.client.DeleteCloudMessages(msgRecordNames); err != nil {
+			log.Warn().Err(err).Int("count", len(msgRecordNames)).Msg("Failed to delete messages from CloudKit")
+		} else {
+			log.Info().Int("count", len(msgRecordNames)).Msg("Deleted message records from CloudKit")
+		}
+	}
+
+	// Background: scan CloudKit for records not in our local DB.
+	go func() {
+		if len(chatRecordNames) == 0 && chatGuid != "" {
+			c.findAndDeleteCloudChatByIdentifier(log, chatGuid)
+		}
+		if chatGuid != "" {
+			c.findAndDeleteCloudMessagesByChatIdentifier(log, chatGuid)
+		}
+	}()
 }
 
 // findAndDeleteCloudChatByIdentifier syncs all chat records from CloudKit,
@@ -2067,59 +2086,6 @@ func (c *IMClient) findAndDeleteCloudMessagesByChatIdentifier(log zerolog.Logger
 	} else {
 		log.Info().Int("count", len(matchingRecordNames)).Str("chat_identifier", chatIdentifier).Msg("Deleted message records found via CloudKit query")
 	}
-}
-
-// deleteCloudMessageByGUID hard-deletes a message's CloudKit record from
-// messageManateeZone so it never comes back on re-backfill — even after a full
-// bridge reset. Tries local DB for record_name first; falls back to a
-// synchronous CloudKit scan by GUID.
-func (c *IMClient) deleteCloudMessageByGUID(log zerolog.Logger, guid string) {
-	// Fast path: local DB has the record_name (CloudKit-backfilled messages).
-	if c.cloudStore != nil {
-		if recordName := c.cloudStore.getRecordNameByGUID(context.Background(), guid); recordName != "" {
-			if err := c.client.DeleteCloudMessages([]string{recordName}); err != nil {
-				log.Warn().Err(err).Str("record_name", recordName).
-					Msg("Failed to hard-delete CloudKit message record")
-			} else {
-				log.Info().Str("record_name", recordName).Str("guid", guid).
-					Msg("Hard-deleted CloudKit message record")
-			}
-			c.cloudStore.softDeleteMessageByGUID(context.Background(), guid)
-			return
-		}
-		c.cloudStore.softDeleteMessageByGUID(context.Background(), guid)
-	}
-
-	// Slow path: scan all CloudKit message records to find record_name by GUID.
-	// Must complete synchronously so the record is gone before we return.
-	log.Info().Str("guid", guid).Msg("Scanning CloudKit for message record to hard-delete")
-	var token *string
-	for page := 0; page < 256; page++ {
-		resp, err := safeCloudSyncMessages(c.client, token)
-		if err != nil {
-			log.Warn().Err(err).Str("guid", guid).
-				Msg("Failed to scan CloudKit messages for delete")
-			return
-		}
-		for _, msg := range resp.Messages {
-			if msg.Guid == guid && msg.RecordName != "" {
-				if delErr := c.client.DeleteCloudMessages([]string{msg.RecordName}); delErr != nil {
-					log.Warn().Err(delErr).Str("record_name", msg.RecordName).
-						Msg("Failed to hard-delete CloudKit message record (scan)")
-				} else {
-					log.Info().Str("record_name", msg.RecordName).Str("guid", guid).
-						Msg("Hard-deleted CloudKit message record (scan)")
-				}
-				return
-			}
-		}
-		prev := ptrStringOr(token, "")
-		token = resp.ContinuationToken
-		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
-			break
-		}
-	}
-	log.Warn().Str("guid", guid).Msg("Message not found in CloudKit — cannot hard-delete")
 }
 
 // ============================================================================

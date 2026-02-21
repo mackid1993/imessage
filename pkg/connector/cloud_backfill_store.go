@@ -1131,6 +1131,97 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 	return nil
 }
 
+// getCloudRecordNamesByPortalID returns all non-empty chat record_names for a portal.
+func (s *cloudBackfillStore) getCloudRecordNamesByPortalID(ctx context.Context, portalID string) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT record_name FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND record_name <> ''`,
+		s.loginID, portalID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// getMessageRecordNamesByPortalID returns all non-empty message record_names for a portal.
+func (s *cloudBackfillStore) getMessageRecordNamesByPortalID(ctx context.Context, portalID string) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT record_name FROM cloud_message WHERE login_id=$1 AND portal_id=$2 AND record_name <> ''`,
+		s.loginID, portalID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// getCloudRecordNamesByGroupID returns all non-empty chat record_names for ANY
+// portal_id that shares the given group_id.
+func (s *cloudBackfillStore) getCloudRecordNamesByGroupID(ctx context.Context, groupID string) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT record_name FROM cloud_chat WHERE login_id=$1 AND LOWER(group_id)=LOWER($2) AND record_name <> ''`,
+		s.loginID, groupID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// getMessageRecordNamesByGroupID returns all non-empty message record_names
+// for portals that share the given group_id.
+func (s *cloudBackfillStore) getMessageRecordNamesByGroupID(ctx context.Context, groupID string) ([]string, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT cm.record_name FROM cloud_message cm
+		INNER JOIN cloud_chat cc ON cc.login_id=cm.login_id AND cc.portal_id=cm.portal_id
+		WHERE cm.login_id=$1 AND LOWER(cc.group_id)=LOWER($2) AND cm.record_name <> ''
+	`, s.loginID, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
 // persistMessageUUID inserts a minimal cloud_message record for a realtime
 // APNs message so the UUID survives restarts. CloudKit-synced messages are
 // already stored via upsertMessageBatch; this covers the realtime path.
