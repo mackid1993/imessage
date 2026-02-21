@@ -1855,11 +1855,24 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	log := zerolog.Ctx(ctx)
+	msgGUID := string(msg.TargetMessage.ID)
+
 	// Track outbound unsend so we can suppress the APNs echo.
-	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
+	c.trackOutboundUnsend(msgGUID)
 
 	conv := c.portalToConversation(msg.Portal)
-	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
+
+	// Move the message to iCloud's Recently Deleted (30-day recoverable).
+	if err := c.client.SendMoveMessagesToRecycleBin(conv, c.handle, []string{msgGUID}); err != nil {
+		log.Warn().Err(err).Str("guid", msgGUID).
+			Msg("Failed to move message to iCloud recycle bin")
+	} else {
+		log.Info().Str("guid", msgGUID).
+			Msg("Moved message to iCloud recycle bin")
+	}
+
+	_, err := c.client.SendUnsend(conv, msgGUID, 0, c.handle)
 	return err
 }
 

@@ -1130,6 +1130,20 @@ func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, porta
 	return err
 }
 
+// getRecordNameByGUID returns the CloudKit record_name for a message GUID.
+// Returns empty string if not found. Used for iCloud message deletion.
+func (s *cloudBackfillStore) getRecordNameByGUID(ctx context.Context, guid string) string {
+	var recordName string
+	err := s.db.QueryRow(ctx,
+		`SELECT record_name FROM cloud_message WHERE login_id=$1 AND guid=$2 AND record_name <> ''`,
+		s.loginID, guid,
+	).Scan(&recordName)
+	if err != nil {
+		return ""
+	}
+	return recordName
+}
+
 // hasMessageUUID checks if a message UUID exists in cloud_message for this login.
 // Used for echo detection: if the UUID is known, the message is an echo of a
 // previously-seen message and should not create a new portal.

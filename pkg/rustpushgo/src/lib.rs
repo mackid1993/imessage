@@ -2700,6 +2700,27 @@ impl Client {
         Ok(())
     }
 
+    /// Send a MoveToRecycleBin for individual messages (30-day recoverable delete).
+    pub async fn send_move_messages_to_recycle_bin(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+        message_uuids: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let delete_msg = MoveToRecycleBinMessage {
+            target: DeleteTarget::Messages(message_uuids),
+            recoverable_delete_date: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        let mut msg = MessageInst::new(conv, &handle, Message::MoveToRecycleBin(delete_msg));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send MoveToRecycleBin for messages: {}", e) })?;
+        Ok(())
+    }
+
     /// Delete chat records from CloudKit so they don't reappear during future syncs.
     pub async fn delete_cloud_chats(
         &self,

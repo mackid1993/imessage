@@ -227,6 +227,14 @@ void* uniffi_rustpushgo_fn_method_client_send_move_to_recycle_bin(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_move_messages_to_recycle_bin(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer handle,
+	RustBuffer message_uuids,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_delete_cloud_chats(
 	void* ptr,
 	RustBuffer chat_ids,
@@ -901,6 +909,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_unsend(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_send_move_to_recycle_bin(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_move_messages_to_recycle_bin(
 	RustCallStatus* out_status
 );
 
