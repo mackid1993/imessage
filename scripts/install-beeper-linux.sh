@@ -406,7 +406,7 @@ open('$CONFIG', 'w').write(text)
             if [ -n "$CARDDAV_USERNAME" ]; then
                 CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
             fi
-            CARDDAV_JSON=$(IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+            CARDDAV_JSON=$(XDG_DATA_HOME="$SESSION_DIR_BASE" "$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
 
             if [ -z "$CARDDAV_JSON" ]; then
                 echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"
@@ -455,12 +455,10 @@ fi
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
 
-# Session dir matches Go sessionDir(): IMESSAGE_DATA_DIR if set, else XDG default
-if [ -n "${IMESSAGE_DATA_DIR:-}" ]; then
-    SESSION_DIR="$IMESSAGE_DATA_DIR"
-else
-    SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
-fi
+# Session dir matches Go sessionDir(): XDG_DATA_HOME/mautrix-imessage
+# (IMESSAGE_DATA_DIR is checked first in Go but not used for multi-instance)
+SESSION_DIR_BASE="${XDG_DATA_HOME:-$HOME/.local/share}"
+SESSION_DIR="$SESSION_DIR_BASE/mautrix-imessage"
 SESSION_FILE="$SESSION_DIR/session.json"
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
     # DB missing — check if session.json can auto-restore (has hardware_key)
@@ -528,7 +526,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 
     # Run login from DATA_DIR so that relative paths (state/anisette/)
     # resolve to the same location as when systemd runs the bridge.
-    (cd "$DATA_DIR" && IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" login -c "$CONFIG")
+    (cd "$DATA_DIR" && XDG_DATA_HOME="$SESSION_DIR_BASE" "$BINARY" login -c "$CONFIG")
     echo ""
 fi
 
@@ -552,7 +550,7 @@ fi
 # Skip interactive prompt if login just ran (login flow already asked)
 if [ -t 0 ] && [ "$NEEDS_LOGIN" = "false" ]; then
     # Get available handles from session state (available after login)
-    AVAILABLE_HANDLES=$(IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
+    AVAILABLE_HANDLES=$(XDG_DATA_HOME="$SESSION_DIR_BASE" "$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
     if [ -n "$AVAILABLE_HANDLES" ]; then
         echo ""
         echo "Preferred handle (your iMessage sender address):"
@@ -609,7 +607,7 @@ BBCTL_DIR="$BBCTL_DIR"
 BBCTL_BRANCH="$BBCTL_BRANCH"
 BINARY="$BINARY"
 CONFIG="$CONFIG"
-export IMESSAGE_DATA_DIR="$DATA_DIR"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 HEADER_EOF
 cat >> "$DATA_DIR/start.sh" << 'BODY_EOF'
 
@@ -691,7 +689,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$DATA_DIR
-Environment=IMESSAGE_DATA_DIR=$DATA_DIR
+Environment=XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5
@@ -713,7 +711,7 @@ After=network.target
 Type=simple
 User=$USER
 WorkingDirectory=$DATA_DIR
-Environment=IMESSAGE_DATA_DIR=$DATA_DIR
+Environment=XDG_DATA_HOME=${XDG_DATA_HOME:-$HOME/.local/share}
 ExecStart=/bin/bash $DATA_DIR/start.sh
 Restart=always
 RestartSec=5

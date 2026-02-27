@@ -20,12 +20,12 @@ const cardDAVKeyFileName = "carddav.key"
 
 // cardDAVKeyDir returns the session data directory where the encryption key is stored.
 func cardDAVKeyDir() string {
-	dir := os.Getenv("XDG_DATA_HOME")
-	if dir == "" {
+	dir, err := sessionDir()
+	if err != nil {
 		home, _ := os.UserHomeDir()
-		dir = filepath.Join(home, ".local", "share")
+		return filepath.Join(home, ".local", "share", "mautrix-imessage")
 	}
-	return filepath.Join(dir, "mautrix-imessage")
+	return dir
 }
 
 // cardDAVKeyPath returns the full path to the CardDAV encryption key file.

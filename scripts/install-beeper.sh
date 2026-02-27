@@ -201,10 +201,22 @@ if [ -t 0 ]; then
         echo ""
         echo "Message History Backfill:"
         echo "  1) iCloud (CloudKit) — sync from iCloud, requires device PIN"
-        echo "  2) Local chat.db — read macOS Messages database, requires Full Disk Access"
-        echo "  3) Disabled — real-time messages only"
+        if [ "$BRIDGE_NAME" = "sh-imessage" ]; then
+            echo "  2) Local chat.db — read macOS Messages database, requires Full Disk Access"
+            echo "  3) Disabled — real-time messages only"
+        else
+            echo "  2) Disabled — real-time messages only"
+        fi
         echo ""
-        read -p "Choose [1/2/3]: " BACKFILL_CHOICE
+        if [ "$BRIDGE_NAME" = "sh-imessage" ]; then
+            read -p "Choose [1/2/3]: " BACKFILL_CHOICE
+        else
+            read -p "Choose [1/2]: " BACKFILL_CHOICE
+            # Remap: multi-instance has no chat.db option, so "2" means disabled
+            if [ "$BACKFILL_CHOICE" = "2" ]; then
+                BACKFILL_CHOICE=3
+            fi
+        fi
         case "$BACKFILL_CHOICE" in
             2)
                 sed -i '' "s/cloudkit_backfill: .*/cloudkit_backfill: true/" "$CONFIG"
@@ -475,7 +487,7 @@ open('$CONFIG', 'w').write(text)
             if [ -n "$CARDDAV_USERNAME" ]; then
                 CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
             fi
-            CARDDAV_JSON=$(IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+            CARDDAV_JSON=$(XDG_DATA_HOME="$SESSION_DIR_BASE" "$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
 
             if [ -z "$CARDDAV_JSON" ]; then
                 echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"
@@ -524,12 +536,10 @@ fi
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
 
-# Session dir matches Go sessionDir(): IMESSAGE_DATA_DIR if set, else XDG default
-if [ -n "${IMESSAGE_DATA_DIR:-}" ]; then
-    SESSION_DIR="$IMESSAGE_DATA_DIR"
-else
-    SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
-fi
+# Session dir matches Go sessionDir(): XDG_DATA_HOME/mautrix-imessage
+# (IMESSAGE_DATA_DIR is checked first in Go but not used for multi-instance)
+SESSION_DIR_BASE="${XDG_DATA_HOME:-$HOME/.local/share}"
+SESSION_DIR="$SESSION_DIR_BASE/mautrix-imessage"
 SESSION_FILE="$SESSION_DIR/session.json"
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
     # DB missing — check if session.json can auto-restore (has hardware_key for Linux, or macOS)
@@ -577,7 +587,7 @@ fi
 
 # Check if backup session state can be restored — validates that session.json
 # and keystore.plist exist AND that the keystore has the referenced keys.
-if [ "$NEEDS_LOGIN" = "true" ] && [ "${FORCE_CLEAR_STATE:-false}" != "true" ] && IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" check-restore 2>/dev/null; then
+if [ "$NEEDS_LOGIN" = "true" ] && [ "${FORCE_CLEAR_STATE:-false}" != "true" ] && XDG_DATA_HOME="$SESSION_DIR_BASE" "$BINARY" check-restore 2>/dev/null; then
     echo "✓ Backup session state validated — bridge will auto-restore login"
     NEEDS_LOGIN=false
 fi
@@ -600,7 +610,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
 
     # Run login from the data directory so the keystore (state/keystore.plist)
     # is written to the same location the launchd service will read from.
-    (cd "$DATA_DIR" && IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" login -c "$CONFIG")
+    (cd "$DATA_DIR" && XDG_DATA_HOME="$SESSION_DIR_BASE" "$BINARY" login -c "$CONFIG")
     echo ""
 fi
 
@@ -624,7 +634,7 @@ fi
 # Skip interactive prompt if login just ran (login flow already asked)
 if [ -t 0 ] && [ "$NEEDS_LOGIN" = "false" ]; then
     # Get available handles from session state (available after login)
-    AVAILABLE_HANDLES=$(IMESSAGE_DATA_DIR="$SESSION_DIR" "$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
+    AVAILABLE_HANDLES=$(XDG_DATA_HOME="$SESSION_DIR_BASE" "$BINARY" list-handles 2>/dev/null | grep -E '^(tel:|mailto:)' || true)
     if [ -n "$AVAILABLE_HANDLES" ]; then
         echo ""
         echo "Preferred handle (your iMessage sender address):"
@@ -689,7 +699,7 @@ BBCTL_DIR="$BBCTL_DIR"
 BBCTL_BRANCH="$BBCTL_BRANCH"
 BINARY="$BINARY"
 CONFIG="$CONFIG_ABS"
-export IMESSAGE_DATA_DIR="$DATA_ABS"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 HEADER_EOF
 cat >> "$DATA_ABS/start.sh" << 'BODY_EOF'
 
@@ -772,8 +782,8 @@ cat > "$PLIST" << PLIST_EOF
         <string>-I/opt/homebrew/include</string>
         <key>CGO_LDFLAGS</key>
         <string>-L/opt/homebrew/lib</string>
-        <key>IMESSAGE_DATA_DIR</key>
-        <string>$DATA_ABS</string>
+        <key>XDG_DATA_HOME</key>
+        <string>${XDG_DATA_HOME:-$HOME/.local/share}</string>
     </dict>
 </dict>
 </plist>

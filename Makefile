@@ -159,8 +159,8 @@ install-beeper-multi: build
 		echo "  Setting up bridge $$i of $$COUNT (sh-imessage-$$i)"; \
 		echo "═══════════════════════════════════════════════"; \
 		BRIDGE_NAME=sh-imessage-$$i \
-		DATA_DIR=$(HOME)/.local/share/mautrix-imessage-$$i \
-		IMESSAGE_DATA_DIR=$(HOME)/.local/share/mautrix-imessage-$$i \
+		XDG_DATA_HOME=$(HOME)/.local/share/imessage-$$i \
+		DATA_DIR=$(HOME)/.local/share/imessage-$$i/mautrix-imessage \
 		BUNDLE_ID=com.lrhodin.mautrix-imessage-$$i \
 		BRIDGE_PORT=$$((4000 + $$i)) \
 		$(MAKE) install-beeper; \
