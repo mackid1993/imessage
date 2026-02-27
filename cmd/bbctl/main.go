@@ -8,6 +8,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 
+	"github.com/beeper/bridge-manager/api/beeperapi"
 	"github.com/beeper/bridge-manager/api/hungryapi"
 )
 
@@ -51,6 +52,22 @@ func prepareApp(ctx *cli.Context) error {
 	newCtx := context.WithValue(ctx.Context, contextKeyConfig, cfg)
 	newCtx = context.WithValue(newCtx, contextKeyEnvConfig, envCfg)
 	if envCfg.HasCredentials() {
+		// If username is missing (e.g. saved by an older version, or login
+		// API returned nil Whoami), fetch it before creating the hungry
+		// client — otherwise UserID will be @:beeper.com and config
+		// generation will produce invalid permissions.
+		if envCfg.Username == "" {
+			fmt.Fprintf(os.Stderr, "Fetching whoami to fill missing username...\n")
+			whoami, whoamiErr := beeperapi.Whoami(baseDomain, envCfg.AccessToken)
+			if whoamiErr != nil {
+				return fmt.Errorf("failed to get whoami: %w", whoamiErr)
+			}
+			envCfg.Username = whoami.UserInfo.Username
+			envCfg.ClusterID = whoami.UserInfo.BridgeClusterID
+			if saveErr := cfg.Save(); saveErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to save config: %v\n", saveErr)
+			}
+		}
 		hungryClient := hungryapi.NewClient(baseDomain, envCfg.Username, envCfg.AccessToken)
 		newCtx = context.WithValue(newCtx, contextKeyHungryClient, hungryClient)
 	}
